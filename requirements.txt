@@ -1,4 +1,7 @@
 streamlit
-matplotlib
-pandas
-numpy
+torch
+torchvision
+torchaudio
+accelerate
+transformers
+reportlab
