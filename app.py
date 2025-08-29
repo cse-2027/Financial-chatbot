@@ -1,119 +1,72 @@
-import re
-import datetime
 import streamlit as st
-import matplotlib.pyplot as plt
-from ibm_watson import AssistantV2
-from ibm_cloud_sdk_core.authenticators import IAMAuthenticator
-from transformers import pipeline
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer, set_seed
+from reportlab.platypus import SimpleDocTemplate, Paragraph
+from reportlab.lib.styles import getSampleStyleSheet
+import datetime
+import os
 
-# --------------------------
-# IBM Watson Setup
-# --------------------------
-API_KEY = "YOUR_IBM_WATSON_API_KEY"
-ASSISTANT_ID = "YOUR_ASSISTANT_ID"
-URL = "YOUR_ASSISTANT_URL"
+# -----------------------------
+# 1️⃣ Streamlit page config
+# -----------------------------
+st.set_page_config(page_title="💬 Financial Chatbot", layout="wide")
+st.title("💬 Personal Financial Chatbot")
 
-authenticator = IAMAuthenticator(API_KEY)
-assistant = AssistantV2(
-    version='2021-11-27',
-    authenticator=authenticator
+# -----------------------------
+# 2️⃣ User input
+# -----------------------------
+user_input = st.text_input("Ask a financial question:")
+send_button = st.button("Send")
+
+# -----------------------------
+# 3️⃣ Device and Model config
+# -----------------------------
+device = "cuda" if torch.cuda.is_available() else "cpu"
+model_path = "ibm-granite/granite-3.3-2b-instruct"
+
+# Load Hugging Face token from Streamlit secrets
+HF_TOKEN = os.getenv("HF_TOKEN")
+
+# Load tokenizer and model
+tokenizer = AutoTokenizer.from_pretrained(model_path, use_auth_token=HF_TOKEN)
+model = AutoModelForCausalLM.from_pretrained(
+    model_path,
+    use_auth_token=HF_TOKEN,
+    torch_dtype=torch.bfloat16 if device=="cuda" else torch.float32,
+    device_map="auto" if device=="cuda" else None,
+    low_cpu_mem_usage=True
 )
-assistant.set_service_url(URL)
+model.to(device)
+model.eval()
 
-if "watson_session" not in st.session_state:
-    session = assistant.create_session(assistant_id=ASSISTANT_ID).get_result()
-    st.session_state.watson_session = session["session_id"]
+# -----------------------------
+# 4️⃣ Query function
+# -----------------------------
+def query_local_granite(input_text):
+    try:
+        input_ids = tokenizer(input_text, return_tensors="pt").to(device)
+        set_seed(42)
+        output = model.generate(**input_ids, max_new_tokens=2048)
+        prediction = tokenizer.batch_decode(output, skip_special_tokens=True)[0]
+        return prediction
+    except Exception as e:
+        return f"Model error: {str(e)}"
 
-# --------------------------
-# Hugging Face Setup
-# --------------------------
-ner = pipeline("ner", model="dslim/bert-base-NER")
+# -----------------------------
+# 5️⃣ Handle user query
+# -----------------------------
+if send_button and user_input:
+    answer = query_local_granite(user_input)
+    st.text_area("Chatbot Response", answer, height=300)
 
-# --------------------------
-# Helpers
-# --------------------------
-def fmt(n: float) -> str:
-    return f"₹{float(n):,.0f}"
-
-# --------------------------
-# Streamlit App
-# --------------------------
-st.set_page_config(page_title="💰 AI Financial Chatbot", layout="centered")
-st.title("🤖 Financial Chatbot ")
-
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-if "history" not in st.session_state:
-    st.session_state.history = {}
-
-# --------------------------
-# User Input
-# --------------------------
-user_input = st.chat_input("Type your finances (e.g. I earned 50000 and spent 15000 on rent)")
-
-if user_input:
-    st.session_state.messages.append({"role": "user", "content": user_input})
-
-    # --- Step 1: Watson Assistant for intent ---
-    watson_response = assistant.message(
-        assistant_id=ASSISTANT_ID,
-        session_id=st.session_state.watson_session,
-        input={"message_type": "text", "text": user_input}
-    ).get_result()
-
-    watson_text = ""
-    if watson_response.get("output", {}).get("generic"):
-        for msg in watson_response["output"]["generic"]:
-            if msg["response_type"] == "text":
-                watson_text += msg["text"] + "\n"
-
-    # --- Step 2: Hugging Face NER to extract money values ---
-    entities = ner(user_input)
-    amounts = [e for e in entities if "MONEY" in e["entity"]]
-
-    # For demo, assume simple parsing
-    income, expenses = 0, 0
-    if "income" in user_input.lower() or "salary" in user_input.lower():
-        # take first amount as income
-        if amounts:
-            income = int(float(re.sub(r"[^\d]", "", amounts[0]["word"])))
-    if "rent" in user_input.lower() or "spent" in user_input.lower():
-        if len(amounts) > 1:
-            expenses = int(float(re.sub(r"[^\d]", "", amounts[1]["word"])))
-
-    savings = income - expenses
-    now = datetime.datetime.now().strftime("%B %Y")
-
-    # --- Save history
-    st.session_state.history[now] = {
-        "income": income,
-        "expenses": expenses,
-        "savings": savings
-    }
-
-    # --- Build reply
-    reply = watson_text
-    reply += f"📊 *Budget Summary ({now}):*\n- Income: {fmt(income)}\n- Expenses: {fmt(expenses)}\n- Savings: {fmt(savings)}"
-
-    st.session_state.messages.append({"role": "bot", "content": reply})
-
-    # --- Chart
-    if expenses > 0:
-        fig, ax = plt.subplots()
-        ax.pie([expenses, savings], labels=["Expenses", "Savings"], autopct="%1.1f%%", startangle=90)
-        ax.axis("equal")
-        st.session_state.messages.append({"role": "bot_chart", "content": fig})
-
-# --------------------------
-# Display Conversation
-# --------------------------
-for msg in st.session_state.messages:
-    if msg["role"] == "user":
-        with st.chat_message("user"):
-            st.write(msg["content"])
-    elif msg["role"] == "bot":
-        with st.chat_message("assistant"):
-            st.markdown(msg["content"])
-    elif msg["role"] == "bot_chart":
-        with st.chat_message("assistant"):
-            st.pyplot(msg["content"])
+    # -----------------------------
+    # 6️⃣ Export chat to PDF
+    # -----------------------------
+    if st.button("Export Chat to PDF"):
+        filename = f"Chat_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
+        doc = SimpleDocTemplate(filename)
+        styles = getSampleStyleSheet()
+        elements = [Paragraph(f"User: {user_input}", styles['Normal'])]
+        elements.append(Paragraph(f"Bot: {answer}", styles['Normal']))
+        doc.build(elements)
+        st.success(f"Chat exported to {filename}")
